@@ -1,5 +1,5 @@
-zfs-replicate is a simple script to *robustly* replicate a file
-system.
+zfs-replicate is a simple script to *robustly* replicate a ZFS data
+set.
 
 BASICS
 ======
