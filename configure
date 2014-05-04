@@ -587,6 +587,7 @@ PACKAGE_URL=''
 ac_unique_file="zfs-replicate"
 ac_subst_vars='LTLIBOBJS
 LIBOBJS
+HELP2MAN
 am__untar
 am__tar
 AMTAR
@@ -2201,6 +2202,10 @@ am__tar='$${TAR-tar} chof - "$$tardir"' am__untar='$${TAR-tar} xf -'
 
 
 
+
+
+
+HELP2MAN=${HELP2MAN-"${am_missing_run}help2man"}
 
 
 ac_config_files="$ac_config_files Makefile"

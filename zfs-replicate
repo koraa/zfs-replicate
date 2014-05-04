@@ -33,62 +33,69 @@ function usage() {
   fi
 
   cat <<EOF
-$(basename $0) SOURCE DEST
-
+Usage: $(basename $0) [OPTION]... SOURCE DEST
 Replicate the SOURCE dataset to the DEST dataset.  Use an incremental
 update if possible.  A data set is specified as follows:
 
   [HOST:]POOL[/DATASET]
 
-Options:
+Mandatory arguments to long options are mandatory for short options too.
 
-  -i, --identity=FILE      The private SSH key to use for authentication.
-                             See ssh(1) for more details.
+  -i, --identity=FILE       The private SSH key to use for authentication.
+                              See ssh(1) for more details.
 
-      --ssh-args           Additional arguments to pass to ssh, if
-                             appropriate.  For example:
-                             --ssh-args="-o BatchMode=yes".
+      --ssh-args            Additional arguments to pass to ssh, if
+                              appropriate.  For example:
+                              --ssh-args="-o BatchMode=yes".
 
-  -r, --recursive          In addition to replicating the specified dataset,
-                             also replicate any children.
+  -r, --recursive           In addition to replicating the specified dataset,
+                              also replicate any children.
 
-      --rollback           If the source and destination have diverged,
-                             enabling this option causes the destination
-                             dataset to be rolled back to the most recent
-                             common snapshot.
+      --rollback            If the source and destination have diverged,
+                              enabling this option causes the destination
+                              dataset to be rolled back to the most recent
+                              common snapshot.
 
-      --snapshot=SNAP      Force zfs-replicate to use the specified snapshot
-                             as the starting point of an incremental
-                             replication.
+      --snapshot=SNAP       Force zfs-replicate to use the specified snapshot
+                              as the starting point of an incremental
+                              replication.
 
-      --dedup              dedup the data stream.  This is a form of
-                             compression on the data stream; the datasets
-                             do not need to have the dedup property set to
-                             take advantage of this.  Enabling this option
-                             can significantly increase the memory
-                             requirement on the source.
+      --dedup               dedup the data stream.  This is a form of
+                              compression on the data stream; the datasets
+                              do not need to have the dedup property set to
+                              take advantage of this.  Enabling this option
+                              can significantly increase the memory
+                              requirement on the source.
 
-      --source-name=NAME   The name of the source and destination system.
-      --dest-name=NAME       These are used for generating the snapshot
-                             names.  By default, they are taken from the
-                             HOST part of the dataset specification or, if
-                             HOST is localhost or missing, it is the result
-                             of hostname.  This overrides that and is
-                             particularly useful if the DNS name changes.
+      --source-name=NAME    The name of the source system.  This are
+                             used when generating the snapshot's name.
+                             By default, it is taken from the HOST
+                             part of the source dataset specification
+                             or, if HOST is localhost or missing, the
+                             result of hostname.  This overrides that
+                             and is primarily useful if the DNS name
+                             changes.
 
-  -p, --progress           Show the transfer's progress.  (This is enable by
-                             default if stdin is a TTY.)
+      --dest-name=NAME      Like --source-name but for the destination.
 
-  -v, --verbose            Be more verbose.
+  -p, --progress            Show the transfer's progress.  (This is enable by
+                              default if stdin is a TTY.)
 
-      --trace              Trace the script's execution.
-      --trace-zfs-commands
+  -v, --verbose             Be more verbose.
 
-  -h, --help               Display this help and exit.
+      --trace               Trace the script's execution.
+
+      --trace-zfs-commands  Print out the invocations of zfs.
+
+  -h, --help                Display this help and exit.
+
+      --version             Print out version information and exit.
 
 Examples:
 
   $(basename $0) -r tank/home backup:tank/backup/home
+
+Report bugs to neal@walfield.org.
 EOF
   exit 1
 }
@@ -100,7 +107,7 @@ ORIG_ARGS=("$@")
 set +e
 TEMP=$(getopt \
          --longoptions \
-             identity:,ssh-args:,recursive,rollback,snapshot,dedup,source-name:,dest-name:,progress,verbose,help,trace,trace-zfs-commands \
+             identity:,ssh-args:,recursive,rollback,snapshot,dedup,source-name:,dest-name:,progress,verbose,help,trace,trace-zfs-commands,version \
          -o i:rs:pvh \
          -n "${0##*/}" -- "$@")
 EC=$?
@@ -160,6 +167,18 @@ do
     --help|-h) usage; shift;;
     --trace) set -x; shift;;
     --trace-zfs-commands) TRACE_ZFS_COMMANDS=1; shift;;
+    --version)
+      cat <<EOF
+zfs-replicate 1.0
+Copyright 2014 Neal H. Walfield <neal@walfield.org>.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>.
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+
+Written by Neal H. Walfield.
+EOF
+      exit 0
+      shift;;
     --) shift; break;;
     *) echo 'Internal error!'; exit 1;;
   esac

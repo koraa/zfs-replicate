@@ -1,7 +1,7 @@
 Source: zfs-replicate
 Priority: optional
 Maintainer: Neal H. Walfield <neal@walfield.org>
-Build-Depends: debhelper (>= 9)
+Build-Depends: debhelper (>= 9), help2man
 Standards-Version: 3.9.4
 Section: utilities
 Homepage: 
