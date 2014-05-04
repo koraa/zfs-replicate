@@ -1,0 +1,232 @@
+#! /bin/bash
+
+# zfs-replicate - Robustly replicate ZFS file systems.
+# Copyright (c) 2014 Neal H. Walfield <neal@walfield.org>
+#
+# zfs-replicate is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License as
+# published by the Free Software Foundation; either version 3 of the
+# License, or (at your option) any later version.
+#
+# zfs-replicate is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+########################################################################
+# Note: if you encouter an error with this test suite, set TRACE to 1, #
+# rerun and then submit a bug report!                                  #
+########################################################################
+
+# Trace execution.
+TRACE=0
+# Whether to be verbose.
+VERBOSE=0
+
+# End of user configuration.
+
+
+# Stop if there is an error.
+set -e
+# Treat accessing unset variables as an error.
+set -u
+
+if test $TRACE -gt 0
+then
+  set -x
+fi
+
+POOL=zfs-replicate-test-$$-$RANDOM
+
+TEMPFILES=$(mktemp)
+
+passed=0
+failed=0
+
+# Make sure we clean everything up.
+function cleanup() {
+  zpool destroy -f $POOL || true
+  rm -f /tmp/$POOL
+
+  while read -r f
+  do
+    rm -f "$f"
+  done <"$TEMPFILES"
+  rm -f "$TEMPFILES"
+}
+trap cleanup EXIT
+
+function tempfile() {
+  T=$(mktemp)
+  echo "$T" >>"$TEMPFILES"
+  echo $T
+}
+
+
+# Run a test.  The first argument is either 0 or 1.  0 means we expect
+# the command to succeed; 1 means we expect it to fail.  If a command
+# fails, we print out its output and exit.
+function run() {
+  if test x"$1" = xxfail
+  then
+    XFAIL=1
+    shift
+  else
+    XFAIL=0
+  fi
+
+  set +e
+  OUTPUT=$(tempfile)
+  "$@" >$OUTPUT 2>&1
+  SUCCESS=$?
+  set -e
+
+  dump=$VERBOSE
+  die=0
+  if test \( $XFAIL -eq 0 -a $SUCCESS -eq 0 \) \
+          -o \( $XFAIL -eq 1 -a $SUCCESS -ne 0 \)
+  then
+    echo "PASS"
+    dump=0
+  else
+    echo "FAIL"
+    dump=1
+    die=1
+  fi
+
+  if test $dump -eq 1
+  then
+    echo -n "  #"
+    for a in "$@"; do
+      echo -n " \"$a\""
+    done
+    echo
+    sed 's/^/  /' <$OUTPUT
+    echo
+  fi
+
+  if test x$1 = xzfs -a $TRACE -gt 0
+  then
+    echo "  source snapshots:"
+    zfs list -t snapshot -r $POOL/a -o name,creation -S creation | sed 's/^/    /'
+    echo "  dest snapshots:"
+    zfs list -t snapshot -r $POOL/b -o name,creation -S creation | sed 's/^/    /'
+  fi
+
+  if test $die -eq 1
+  then
+    exit 1
+  fi
+}
+
+# Create a ZFS pool.  Note: the minimum pool size is 64MB.
+OUTPUT=$(tempfile)
+if ! dd if=/dev/zero of=/tmp/$POOL bs=4k count=16k >$OUTPUT 2>&1
+then
+  cat $OUTPUT
+  exit 1
+fi
+zpool create $POOL /tmp/$POOL
+
+# Create a data set.
+if ! zfs create $POOL/a
+then
+  echo "Unable to create a ZFS data set!"
+  exit 1
+fi
+
+# Make sure the data set is mounted.
+ROOT=$(zfs get -Hp mountpoint $POOL/a | awk -F'\t' '{ print $3 }')
+MOUNTED=$(zfs get -Hp mounted $POOL/a | awk -F'\t' '{ print $3 }')
+if ! test x$MOUNTED = xyes
+then
+  zfs mount $POOL/a
+fi
+
+# Synthesize some data.
+for i in $(seq 1 10)
+do
+  echo $i > $ROOT/$i
+done
+
+ARGS=""
+if test $TRACE -gt 0
+then
+  ARGS="$ARGS --trace"
+fi
+if test $VERBOSE -gt 0
+then
+  ARGS="$ARGS -v"
+fi
+
+echo -n "Replicating data set (local to remote replica): "
+run ./zfs-replicate $ARGS --source-name=local $POOL/a --dest-name=remote $POOL/b
+
+# Make sure the data set is mounted.
+ROOT_REPLICA=$(zfs get -Hp mountpoint $POOL/b \
+               | awk -F'\t' '{ print $3 }')
+MOUNTED=$(zfs get -Hp mounted $POOL/b | awk -F'\t' '{ print $3 }')
+if ! test x$MOUNTED = xyes
+then
+  zfs mount $POOL/b
+fi
+
+echo -n "Comparing source and replica: "
+run diff -r "$ROOT" "$ROOT_REPLICA"
+
+echo -n "Replicating data set (local to remote replica, 2): "
+run ./zfs-replicate $ARGS --source-name=local $POOL/a --dest-name=remote $POOL/b
+
+echo -n "Comparing source and replica: "
+run diff -r "$ROOT" "$ROOT_REPLICA"
+
+echo "Modifying the source repository."
+for i in $(seq 11 20)
+do
+  echo $i > "$ROOT/$i"
+done
+
+echo -n "Replicating local to remote (using dedup): "
+run ./zfs-replicate $ARGS --dedup \
+        --source-name=local $POOL/a --dest-name=remote $POOL/b
+
+echo -n "Comparing source and replica: "
+run diff -r "$ROOT" "$ROOT_REPLICA"
+
+echo -n "Modifying replica.  replication should now fail: "
+zfs set readonly=off $POOL/b
+touch $ROOT_REPLICA/bar
+zfs set readonly=on $POOL/b
+run xfail ./zfs-replicate $ARGS --source-name=local $POOL/a --dest-name=remote $POOL/b
+
+echo -n "Rolling back replica.  replication should now succeed: "
+run ./zfs-replicate $ARGS --rollback \
+        --source-name=local $POOL/a --dest-name=remote $POOL/b
+
+echo -n "Comparing source and replica: "
+run diff -r "$ROOT" "$ROOT_REPLICA"
+
+echo -n "Replicating local to remote (using dedup): "
+run ./zfs-replicate $ARGS --dedup \
+        --source-name=local $POOL/a --dest-name=remote $POOL/b
+
+echo -n "Comparing source and replica: "
+run diff -r "$ROOT" "$ROOT_REPLICA"
+
+echo "Modifying the source repository."
+for i in $(seq 11 20)
+do
+  echo $i > "$ROOT/$i"
+done
+
+echo -n "Replicating local to remote (using dedup): "
+run ./zfs-replicate $ARGS --dedup \
+        --source-name=local $POOL/a --dest-name=remote $POOL/b
+
+echo -n "Comparing source and replica: "
+run diff -r "$ROOT" "$ROOT_REPLICA"
+
+echo "All tests PASSED."

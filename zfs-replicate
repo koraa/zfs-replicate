@@ -1,0 +1,780 @@
+#! /bin/bash
+
+# zfs-replicate - Robustly replicate ZFS file systems.
+# Copyright (c) 2014 Neal H. Walfield <neal@walfield.org>
+#
+# zfs-replicate is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License as
+# published by the Free Software Foundation; either version 3 of the
+# License, or (at your option) any later version.
+#
+# zfs-replicate is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Stop if there is an error.
+set -e
+# Treat accessing unset variables as an error.
+set -u
+
+# Sorry, this program is not internationalized.  Importantly, we parse
+# the output of zfs (among other commands).
+export LC_ALL=C
+
+function usage() {
+  if test $# -gt 0
+  then
+    echo "$@"
+    echo
+  fi
+
+  cat <<EOF
+$(basename $0) SOURCE DEST
+
+Replicate the SOURCE dataset to the DEST dataset.  Use an incremental
+update if possible.  A data set is specified as follows:
+
+  [HOST:]POOL[/DATASET]
+
+Options:
+
+  -i, --identity=FILE      The private SSH key to use for authentication.
+                             See ssh(1) for more details.
+
+      --ssh-args           Additional arguments to pass to ssh, if
+                             appropriate.  For example:
+                             --ssh-args="-o BatchMode=yes".
+
+  -r, --recursive          In addition to replicating the specified dataset,
+                             also replicate any children.
+
+      --rollback           If the source and destination have diverged,
+                             enabling this option causes the destination
+                             dataset to be rolled back to the most recent
+                             common snapshot.
+
+      --snapshot=SNAP      Force zfs-replicate to use the specified snapshot
+                             as the starting point of an incremental
+                             replication.
+
+      --dedup              dedup the data stream.  This is a form of
+                             compression on the data stream; the datasets
+                             do not need to have the dedup property set to
+                             take advantage of this.  Enabling this option
+                             can significantly increase the memory
+                             requirement on the source.
+
+      --source-name=NAME   The name of the source and destination system.
+      --dest-name=NAME       These are used for generating the snapshot
+                             names.  By default, they are taken from the
+                             HOST part of the dataset specification or, if
+                             HOST is localhost or missing, it is the result
+                             of hostname.  This overrides that and is
+                             particularly useful if the DNS name changes.
+
+  -p, --progress           Show the transfer's progress.  (This is enable by
+                             default if stdin is a TTY.)
+
+  -v, --verbose            Be more verbose.
+
+      --trace              Trace the script's execution.
+      --trace-zfs-commands
+
+  -h, --help               Display this help and exit.
+
+Examples:
+
+  $(basename $0) -r tank/home backup:tank/backup/home
+EOF
+  exit 1
+}
+
+# Stash away the original arguments.
+declare -a ORIG_ARGS
+ORIG_ARGS=("$@")
+
+set +e
+TEMP=$(getopt \
+         --longoptions \
+             identity:,ssh-args:,recursive,rollback,snapshot,dedup,source-name:,dest-name:,progress,verbose,help,trace,trace-zfs-commands \
+         -o i:rs:pvh \
+         -n "${0##*/}" -- "$@")
+EC=$?
+set -e
+if test $EC != 0
+then
+  echo "Try \`$0 --help' for more information."
+  exit 1
+fi
+eval set -- "$TEMP"
+
+# Compress the stream.  Don't use an escape character.
+SSH_ARGS="-C -o EscapeChar=none"
+ZFS_SEND_ARGS="-v"
+# -F: destroy any file systems and snapshots on the receiving side
+# that do not exist on the sending side.
+ZFS_RECEIVE_ARGS="-F"
+ZFS_RECURSIVE=""
+# If the destination file system has changes, then we first need to
+# roll back.  We only roll back if the user explicitly permits it.
+MAY_ROLL_BACK=0
+# The base snapshot for an incremental transfer.
+COMMON_SNAPSHOT=""
+COMMON_SNAPSHOT_SET_BY_USER=0
+SOURCE_NAME=""
+DEST_NAME=""
+# Whether to display the data transfer's progress.  By default, show
+# the progress report if stdin is a tty.
+if tty -s
+then
+  SHOW_PROGRESS=1
+else
+  SHOW_PROGRESS=0
+fi
+VERBOSE=0
+TRACE_ZFS_COMMANDS=0
+
+while true
+do
+  case "$1" in
+    --identity|-i) SSH_ARGS="$SSH_ARGS -i $2"; shift; shift;;
+    --ssh-args) SSH_ARGS="$SSH_ARGS $2"; shift; shift;;
+    --recursive|-r)
+      ZFS_SEND_ARGS="$ZFS_SEND_ARGS -R";
+      ZFS_RECURSIVE="-r";
+      shift;;
+    --rollback) MAY_ROLL_BACK=1; shift;;
+    --snapshot|-s)
+      COMMON_SNAPSHOT="$2";
+      COMMON_SNAPSHOT_SET_BY_USER=1;
+          shift; shift;;
+    --dedup) ZFS_SEND_ARGS="$ZFS_SEND_ARGS -D"; shift;;
+    --source-name) SOURCE_NAME="$2"; shift; shift;;
+    --dest-name) DEST_NAME="$2"; shift; shift;;
+    --progress|-p) SHOW_PROGRESS=1; shift;;
+    --verbose|-v) VERBOSE=1; shift;;
+    --help|-h) usage; shift;;
+    --trace) set -x; shift;;
+    --trace-zfs-commands) TRACE_ZFS_COMMANDS=1; shift;;
+    --) shift; break;;
+    *) echo 'Internal error!'; exit 1;;
+  esac
+done
+
+# If fmt does not exist, just use cat instead.
+if ! fmt --help >/dev/null 2>&1
+then
+  function fmt() {
+    cat
+  }
+fi
+
+function verbose() {
+  if test $VERBOSE -gt 0
+  then
+    echo "$@"
+  fi
+}
+
+function vcat() {
+  if test $VERBOSE -gt 0
+  then
+    cat "$@"
+  fi
+}
+
+if test $# != 2
+then
+  usage "Two positional arguments expected, but got $# ($(for a in "$@"; do echo "\"$a\""; done))."
+fi
+
+# Parse the positional parameters.
+SOURCE_HOST=$1
+# The datapool is everything after ':'.
+SOURCE=${SOURCE_HOST/#*:/}
+# To get the host, we just exclude the data pool and : preceding it.
+SOURCE_HOST=${SOURCE_HOST%$SOURCE}
+SOURCE_HOST=${SOURCE_HOST%:}
+if test x"$SOURCE_HOST" = x
+then
+  SOURCE_HOST=localhost
+fi
+
+if test x"$SOURCE_NAME" = x
+then
+  if test x"$SOURCE_HOST" = xlocalhost
+  then
+    SOURCE_NAME=$(hostname)
+  else
+    SOURCE_NAME=$SOURCE_HOST
+  fi
+fi
+
+DEST_HOST=$2
+DEST=${DEST_HOST/#*:/}
+DEST_HOST=${DEST_HOST%$DEST}
+DEST_HOST=${DEST_HOST%:}
+if test x"$DEST_HOST" = x
+then
+  DEST_HOST=localhost
+fi
+
+if test x"$DEST_NAME" = x
+then
+  if test x"$DEST_HOST" = xlocalhost
+  then
+    DEST_NAME=$(hostname)
+  else
+    DEST_NAME=$DEST_HOST
+  fi
+fi
+
+verbose "source: host: '$SOURCE_HOST' (name: '$SOURCE_NAME'); datapool: '$SOURCE'"
+verbose "dest: host: '$DEST_HOST' (name: '$DEST_NAME'); datapool: '$DEST'"
+
+# The name of a data pool may not be the empty string.
+if test x"$SOURCE" = x
+then
+  usage "No source data pool specified."
+fi
+
+if test x"$DEST" = x
+then
+  usage "No destination data pool specified."
+fi
+
+# Make sure we clean everything up on exit, even if we die.
+# A file containing the list of temp files.
+TEMPFILES=$(mktemp)
+# The SSH control ports (if any).
+SOURCE_SSH_CONTROL=
+DEST_SSH_CONTROL=
+# Whether we successfully performed the replication (0 = no, 1 = yes).
+REPLICATED=0
+# The name of the snapshot that we made on the source.
+SNAPSHOT=""
+# A list of all of the relevant (i.e., zfs-replicate-dest-timestamp)
+# snapshots on the source.
+SOURCE_SNAPSHOTS=""
+
+function cleanup() {
+  # Delete stale snapshots on the source.
+  #
+  # Note: if the user specified the snapshot to use and the
+  # replication failed, don't purge any snapshots!
+  if test x"$SNAPSHOT" != x -a x"$SOURCE_SNAPSHOTS" != x \
+       -a \( $COMMON_SNAPSHOT_SET_BY_USER -eq 0 -o $REPLICATED -eq 1 \)
+  then
+    OUTPUT=$(tempfile)
+    function purge() {
+      snapshot=$1
+
+      verbose "  Releasing snapshot $SOURCE_NAME:$snapshot"
+      # zfs_source release $ZFS_RECURSIVE "$DEST_NAME:$DEST" "$snapshot" \
+      #   || true
+      if ! zfs_source destroy $ZFS_RECURSIVE "$snapshot" >$OUTPUT 2>&1
+      then
+        echo "  WARNING: Error destroying stale snapshot $SOURCE_NAME:$snapshot:"
+        echo
+        cat $OUTPUT
+      fi
+    }
+
+    verbose "Purging stale snapshots from source."
+    if test $REPLICATED -eq 0 -a x"$COMMON_SNAPSHOT" = x
+    then
+      # If REPLICATED=0 (failure) and COMMON_SNAPSHOT='', then we
+      # probably didn't reach the destination and we certainly didn't
+      # complete the upload successfully.  In this case, we only know
+      # that $SNAPSHOT is invalid.
+      purge "$SOURCE@$SNAPSHOT"
+    else
+      # If an error arose (REPLICATED=0), we can't be certain that the
+      # replication really failed: we could have transferred all of
+      # the data, but the connection died in the clean up phase
+      # (resulting in ssh returning a non-zero exit code)!  In this
+      # case, deleting $SNAPSHOT is a small disaster as we lose our
+      # reference point and would need to rollback the destination to
+      # a common snapshot.  Thus, in the case of an apparent failure,
+      # we delete all zfs-replicate maintained snapshots except
+      # $SNAPSHOT and $COMMON_SNAPSHOT.  If we know we succeeded, then
+      # we delete all zfs-replicate maintained snapshots except
+      # $SNAPSHOT.
+      awk -F'\t' '
+      {
+        # Always keep $SNAPSHOT.  Keep $COMMON_SNAPSHOT if we are
+        # not sure the replication was successful.
+        if (! ($1 == "'"$SOURCE@$SNAPSHOT"'" \
+               || ('"$REPLICATED"' == 0 \
+                   && $1 == "'"$SOURCE@$COMMON_SNAPSHOT"'")))
+          print $1
+      }' < "$SOURCE_SNAPSHOTS" | while read -r snapshot
+      do
+        purge "$snapshot"
+      done
+    fi
+  fi
+
+  # Close down the ssh connections.
+  if test x"$SOURCE_SSH_CONTROL" != x
+  then
+    ssh -o ControlPath=$SOURCE_SSH_CONTROL -O exit $SOURCE_HOST 2>/dev/null
+  fi
+  if test x"$DEST_SSH_CONTROL" != x
+  then
+    ssh -o ControlPath=$DEST_SSH_CONTROL -O exit $DEST_HOST 2>/dev/null
+  fi
+
+  # Delete the temp files.
+  while read -r f
+  do
+    rm -f "$f"
+  done <"$TEMPFILES"
+  rm -f "$TEMPFILES"
+}
+trap cleanup EXIT
+
+function tempfile() {
+  T=$(mktemp)
+  # Add the temp file to the list of temp files to ensure that it is
+  # cleaned up on exit.
+  echo "$T" >>"$TEMPFILES"
+  echo $T
+}
+
+# Set up a reusable ssh connection, if appropriate.
+if test x"$SOURCE_HOST" != xlocalhost
+then
+  # Note: there is a small race here: ssh won't use a file for the
+  # control port if it exists.
+  SOURCE_SSH_CONTROL=$(tempfile)
+  rm -f $SOURCE_SSH_CONTROL
+  ssh $SSH_ARGS -o ControlMaster=yes -o ControlPath=$SOURCE_SSH_CONTROL \
+    -o ControlPersist=yes "$SOURCE_HOST" true
+fi
+
+if test x"$DEST_HOST" != xlocalhost
+then
+  DEST_SSH_CONTROL=$(tempfile)
+  rm -f $DEST_SSH_CONTROL
+  ssh $SSH_ARGS -o ControlMaster=yes -o ControlPath=$DEST_SSH_CONTROL \
+    -o ControlPersist=yes "$DEST_HOST" true
+fi
+
+if test x"$SOURCE_HOST" = xlocalhost -o x"$DEST_HOST" = xlocalhost
+then
+  # Find the 'zfs'.  Start with just 'zfs': we prefer the version in the
+  # PATH.  Otherwise, try /sbin/zfs (the default location on the systems
+  # I've tested) and /usr/local/sbin/zfs.  Note: we do this to make the
+  # user's life easier: when running from Vixie cron, only /bin and
+  # /usr/bin are in the user's path (even root) unless explicitly
+  # overriden.
+  for ZFS in zfs /sbin/zfs /usr/local/sbin/zfs missing
+  do
+    if test x"$ZFS" = xmissing
+    then
+      echo "zfs: command not found." >&2
+      exit 1
+    fi
+  
+    if $ZFS --help >/dev/null 2>&1
+    then
+      break
+    fi
+  done
+
+  if test x"$ZFS" != xzfs
+  then
+    verbose "Found zfs as '$ZFS'."
+  fi
+fi
+
+# Execute zfs on the source.
+if test "x$SOURCE_HOST" = xlocalhost
+then
+  function zfs_source() {
+    if test $TRACE_ZFS_COMMANDS -gt 0
+    then
+      echo "SOURCE: $ZFS $@" >&2
+    fi
+    $ZFS "$@"
+  }
+else
+  function zfs_source() {
+    if test $TRACE_ZFS_COMMANDS -gt 0
+    then
+      echo "SOURCE: zfs $@" >&2
+    fi
+    ssh $SSH_ARGS -o ControlPath=$SOURCE_SSH_CONTROL "$SOURCE_HOST" zfs "$@"
+  }
+fi
+
+# Execute zfs on the destination.
+if test "x$DEST_HOST" = xlocalhost
+then
+  function zfs_dest() {
+    if test $TRACE_ZFS_COMMANDS -gt 0
+    then
+      echo "DEST: $ZFS $@" >&2
+    fi
+    $ZFS "$@"
+  }
+else
+  function zfs_dest() {
+    if test $TRACE_ZFS_COMMANDS -gt 0
+    then
+      echo "DEST: zfs $@" >&2
+    fi
+    ssh $SSH_ARGS -o ControlPath=$DEST_SSH_CONTROL "$DEST_HOST" zfs "$@"
+  }
+fi
+
+# Make sure the source dataset exists.
+if ! zfs_source list "$SOURCE" >/dev/null
+then
+  echo "'$SOURCE_HOST:$SOURCE': source dataset not available.  Aborting."
+  exit 1
+fi
+
+# A snapshot name may contain alpha numeric characters as well as the
+# four special characters [-_:.] (see:
+# http://docs.oracle.com/cd/E26502_01/html/E29007/gbcpt.html).
+SNAPSHOT_PREFIX=$(echo "zfs-replicate-FROM-$SOURCE_NAME:$SOURCE-TO-$DEST_NAME:$DEST-" \
+                  | sed 's/[^-a-zA-Z0-9_:.]/_/g')
+
+# Get any relevant snapshots.  Only consider those snapshots with our
+# prefix.
+SOURCE_SNAPSHOTS_ALL=$(tempfile)
+SOURCE_SNAPSHOTS=$(tempfile)
+zfs_source list -H -r "$SOURCE" -t snapshot \
+  -o 'name,creation' -S creation >$SOURCE_SNAPSHOTS_ALL
+awk '{
+  if (index($1, "'"$SOURCE@$SNAPSHOT_PREFIX"'") == 1)
+    print $0
+}' $SOURCE_SNAPSHOTS_ALL >$SOURCE_SNAPSHOTS
+SOURCE_SNAPSHOT_COUNT=$(wc -l < $SOURCE_SNAPSHOTS)
+verbose "source has $SOURCE_SNAPSHOT_COUNT relevant snapshots:"
+vcat $SOURCE_SNAPSHOTS | sed 's/^/  /'
+
+# Create a snapshot.  Note: if the user calls this function in a tight
+# loop, it is conceivable that the SNAPSHOT will already be in use.
+# Since this is rather unlikely, we just sleep for a second rather
+# than try to add a suffix.
+OUTPUT=$(tempfile)
+while true
+do
+  SNAPSHOT="$SNAPSHOT_PREFIX$(date +%Y.%m.%d-%H.%M.%S)"
+  if zfs_source snapshot $ZFS_RECURSIVE "$SOURCE@$SNAPSHOT" >$OUTPUT 2>&1
+  then
+    break
+  else
+    if tr '\n' ' ' <$OUTPUT | sed 's/[ \t]+/ /g' | grep -q 'dataset already exists'
+    then
+      cat <<EOF
+Snapshot $SNAPSHOT already exists.  Sleeping for a second and trying again.
+EOF
+      sleep 1
+    else
+      echo "Creating snapshot $SOURCE@$SNAPSHOT:"
+      echo
+      sed 's/^/  /' < $OUTPUT
+      exit 1
+    fi
+  fi
+done
+verbose "Created snapshot $SOURCE@$SNAPSHOT"
+
+# A hold is a user reference.  It prevents the snapshot from being
+# destroy.  But, it also prevents the containing dataset from being
+# destroy or being rollback (if the rollback would delete the
+# snapshot).  This would be okay if the error message was usable.
+# Unfortunately, it isn't:
+#
+#   cannot destroy 'tank/dataset': dataset is busy
+#
+# Since people probably don't delete random snapshots, this extra
+# protection is probably unneeded.  Disable it.  We can always
+# reenable it later, if appropriate.  (Uncomment the following line
+# and the commented lines that call zfs release.)
+
+# zfs_source hold $ZFS_RECURSIVE "$DEST_NAME:$DEST" "$SOURCE@$SNAPSHOT"
+
+
+# Summarze the output (on stdin) of zfs send -vP.  The raw output
+# looks like the following:
+#
+# full	test/a@1	5157384
+# size	5157384
+# 22:48:57	1293864	test/a@1
+# 22:48:58	1830128	test/a@1
+# 22:48:59	2407568	test/a@1
+# 22:49:00	5795856	test/a@1
+# 22:49:01	6381120	test/a@1
+function parse_progress() {
+  awk -F'\t' '
+   function human_readable_amount(amount, suffix)
+   {
+     if (amount > 2 * 1024 * 1024 * 1024 * 1024) {
+       amount = amount / (1024 * 1024 * 1024 * 1024)
+       suffix = "TiB"
+     } else if (amount > 2 * 1024 * 1024 * 1024) {
+       amount = amount / (1024 * 1024 * 1024)
+       suffix = "GiB"
+     } else if (amount > 2 * 1024 * 1024) {
+       amount = amount / (1024 * 1024)
+       suffix = "MiB"
+     } else if (amount > 2 * 1024) {
+       amount = amount / 1024
+       suffix = "KiB"
+     } else {
+       return (sprintf("%d bytes", amount))
+     }
+     return (sprintf("%.1f %s", amount, suffix))
+   }
+   function human_readable_time(seconds, suffix) {
+     if (seconds > 2 * 24 * 60 * 60) {
+       seconds = seconds / (24 * 60 * 60)
+       suffix = "days"
+     } else if (seconds > 2 * 60 * 60) {
+       seconds = seconds / (60 * 60)
+       suffix = "hours"
+     } else if (seconds > 2 * 60) {
+       seconds = seconds / 60
+       suffix = "minutes"
+     } else {
+       return (sprintf("%d seconds", seconds))
+     }
+     return (sprintf("%.1f %s", seconds, suffix))
+   }
+
+   {
+     seconds ++
+     amount=$2
+   }
+
+   END {
+     printf("Transferred %s in %s (%s / sec)\n",
+            human_readable_amount(amount),
+            human_readable_time(seconds),
+            human_readable_amount(amount / seconds))
+   }'<$SEND_STDERR
+}
+
+if test $SHOW_PROGRESS -eq 0
+then
+  SEND_STDERR=$(tempfile)
+  ZFS_SEND_ARGS="$ZFS_SEND_ARGS -P"
+else
+  SEND_STDERR='/dev/stderr'
+fi
+
+if ! zfs_dest list "$DEST" >/dev/null 2>&1
+then
+  fmt <<EOF
+'$DEST_NAME:$DEST': destination dataset does not exist.  Assuming initial
+replication.
+EOF
+  zfs_source send $ZFS_SEND_ARGS "$SOURCE@$SNAPSHOT" \
+        2>$SEND_STDERR \
+    | zfs_dest receive $ZFS_RECEIVE_ARGS "$DEST"
+
+  REPLICATED=1
+
+  # Make the replication read-only to prevent inadvertent changes.
+  zfs_dest set readonly=on "$DEST"
+
+  if test x$SEND_STDERR != x/dev/stderr
+  then
+    parse_progress || true
+  fi
+
+  exit 0
+fi
+
+verbose "Destination $DEST_NAME:$DEST already exists.  Assuming incremental backup."
+
+DEST_SNAPSHOTS_ALL=$(tempfile)
+DEST_SNAPSHOTS=$(tempfile)
+zfs_dest list -H -r "$DEST" -t snapshot \
+  -o 'name,creation' -S creation >$DEST_SNAPSHOTS_ALL
+awk '{
+  if (index($1, "'"$DEST@$SNAPSHOT_PREFIX"'") == 1)
+    print $0
+}' $DEST_SNAPSHOTS_ALL >$DEST_SNAPSHOTS
+DEST_SNAPSHOT_COUNT=$(wc -l < $DEST_SNAPSHOTS)
+verbose "dest has $DEST_SNAPSHOT_COUNT relevant snapshots:"
+vcat $DEST_SNAPSHOTS | sed 's/^/  /'
+
+if test x"$COMMON_SNAPSHOT" != x
+then
+  # The user specified a snapshot to use.  Make sure it exists on the
+  # source and the destination.
+  SOURCE_HAS_SNAPSHOT=$(sed 's/@/\t/' < $SOURCE_SNAPSHOTS_ALL \
+    | awk -F'\t' '{ if (index($2, "'"$COMMON_SNAPSHOT"'") == 1) print 1 }')
+  DEST_HAS_SNAPSHOT=$(sed 's/@/\t/' < $DEST_SNAPSHOTS_ALL \
+    | awk -F'\t' '{ if (index($2, "'"$COMMON_SNAPSHOT"'") == 1) print 1 }')
+
+  if test x"$SOURCE_HAS_SNAPSHOT" != x1
+  then
+    echo "Source does not have a snapshot named $COMMON_SNAPSHOT"
+  fi
+  if test x"$DEST_HAS_SNAPSHOT" != x1
+  then
+    echo "Destination does not have a snapshot named $COMMON_SNAPSHOT"
+  fi
+  if test x"$SOURCE_HAS_SNAPSHOT" != x1 -o x"$DEST_HAS_SNAPSHOT" != x1
+  then
+    exit 1
+  fi
+else
+  # The user did not specify a snapshot to use.  Use the most recent
+  # zfs-replicate snapshot, if there is one.  Otherwise, look for a
+  # common snapshot.
+
+  # Since the snapshots are sorted from newest to oldest, the first
+  # duplicate will be the most recent common snapshot.
+  COMMON_SNAPSHOT=$(cat $DEST_SNAPSHOTS $SOURCE_SNAPSHOTS \
+      | sed 's/@/\t/' \
+      | awk -F'\t' '{ if ($2 in seen) { print $2; exit 0 } seen[$2] = 1; }')
+  if test x"$COMMON_SNAPSHOT" = x
+  then
+    COMMON_SNAPSHOT_FILE=$(tempfile)
+    cat <<EOF
+$SOURCE_NAME:$SOURCE and $DEST_NAME:$DEST have no common zfs-replicate
+snapshots!  Either the destination repository is not a replica of the
+source or this is the first time that you are using zfs-replicate.  You
+can force zfs-replicate to use a specific snapshot that is not managed by
+zfs-replicate using the --snapshot option.
+
+Common snapshots:
+EOF
+    cat $DEST_SNAPSHOTS_ALL $SOURCE_SNAPSHOTS_ALL \
+      | sed 's/@/\t/' \
+      | awk -F'\t' '
+  BEGIN { have_one = 0 }
+  {
+    if ($2 in seen) {
+      printf("  %s\t%s\t", $2, $3)
+      if ($3 == seen[$2])
+        printf("\tcreation time matches")
+      printf("\n")
+      print $2 > "/dev/stderr"
+      have_one = 1
+    }
+    seen[$2] = $3
+  }
+  END { if (! have_one) print "  None." }
+' 2>$COMMON_SNAPSHOT_FILE
+    if test $(wc -l < $COMMON_SNAPSHOT_FILE) -ge 1
+    then
+      read -r COMMON_SNAPSHOT < $COMMON_SNAPSHOT_FILE
+      fmt <<EOF
+
+Trying the most reasonable match ($COMMON_SNAPSHOT)
+EOF
+    else
+      exit 1
+    fi
+  fi
+fi
+
+verbose "Basing incremental update on snapshot $COMMON_SNAPSHOT."
+
+# 'zfs receive -F' does two things: it first rolls back to the most
+# recent snapshot and then, after the transfer completes, it deletes
+# any snapshots on the destination that don't exist on the source.  We
+# want the latter behavior, but not the former.  To avoid this, we
+# immediately create a snapshot on the destination.  In this way, the
+# zfs receive will roll back to this snapshot (which is then a NOP),
+# but still flush any old snapshots on success.
+zfs_dest snapshot "$DEST@$SNAPSHOT-pre"
+
+RECV_STDERR=$(tempfile)
+if ! zfs_source send $ZFS_SEND_ARGS \
+             -i "$SOURCE@$COMMON_SNAPSHOT" "$SOURCE@$SNAPSHOT" \
+             2>$SEND_STDERR \
+       | zfs_dest receive $ZFS_RECEIVE_ARGS "$DEST" 2>$RECV_STDERR
+then
+  # Reformat the output to remove any newlines and to compress any
+  # white space.
+  ERR=$(tempfile)
+  tr '\n' ' ' <$RECV_STDERR | sed 's/[ \t]+/ /g' > $ERR
+  if (grep -F -q 'cannot receive incremental stream: destination' $ERR \
+      && grep -F -q 'has been modified since most recent snapshot' $ERR) \
+     || (grep -F -q 'cannot receive incremental stream: most recent snapshot of' $ERR \
+         && grep -F -q 'does not match incremental source' $ERR)
+  then
+    fmt <$RECV_STDERR
+    if test $MAY_ROLL_BACK -eq 1
+    then
+      echo
+      echo "Rolling back $DEST_NAME:$DEST to $DEST_NAME:$DEST@$COMMON_SNAPSHOT"
+      zfs_dest rollback -r "$DEST@$COMMON_SNAPSHOT"
+      # Now, try sending the file system again.
+      if ! zfs_source send $ZFS_SEND_ARGS \
+                       -i "$SOURCE@$COMMON_SNAPSHOT" "$SOURCE@$SNAPSHOT" \
+                       2>$SEND_STDERR \
+                 | zfs_dest receive $ZFS_RECEIVE_ARGS "$DEST" 2>$RECV_STDERR
+      then
+        echo
+        echo "An error occured.  Aborting."
+        exit 1
+      fi
+    else
+      fmt<<EOF
+
+Aborting.  To force zfs-replicate to rollback the destination to
+$DEST@$COMMON_SNAPSHOT, invoke $0 with --rollback:
+
+  $0 --rollback$(for w in "${ORIG_ARGS[@]}"; do echo -n " \"$w\""; done)
+EOF
+      exit 1
+    fi
+  else
+    # Unknown error.  Just split out zfs's error message and quit.
+    echo
+    echo "An error occured.  Aborting."
+    exit 1
+  fi
+fi
+
+# If we got this far, then the transfer was a success!
+REPLICATED=1
+
+if test x$SEND_STDERR != x/dev/stderr
+then
+  parse_progress || true
+fi
+
+# If we do a recursive send (zfs send -R) and a destructive receive
+# (zfs receive -F), then we don't need to manually delete any stale
+# snapshots on the destination: the push adds any snapshots on the
+# source to the destination and removes any snapshots not on the
+# source from the destination.  If we don't do a recursive send, only
+# the spanshot specified in the 'zfs send' is added to the destination
+# dataset.  Thus, in this case, we need to manually remove any stale
+# snapshots.
+if test "x$ZFS_RECURSIVE" == x
+then
+  verbose "Purging stale snapshots from destination."
+  OUTPUT=$(tempfile)
+  awk -F'\t' '
+    BEGIN { print "'"$DEST@$SNAPSHOT-pre"'" }
+    { print $1 }
+  ' < "$DEST_SNAPSHOTS" | while read -r snapshot
+  do
+    verbose "  Releasing snapshot $DEST_NAME:$snapshot"
+    if ! zfs_dest destroy $ZFS_RECURSIVE "$snapshot" >$OUTPUT 2>&1
+    then
+      echo "  WARNING: Error destroying stale snapshot $DEST_NAME:$snapshot:"
+      echo
+      cat $OUTPUT
+    fi
+  done
+fi
+
+exit 0

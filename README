@@ -1,0 +1,179 @@
+zfs-replicate is a simple script to *robustly* replicate a file
+system.
+
+BASICS
+======
+
+Invocation
+----------
+
+If we have two computers, a live system ('live') and a backup system
+('backup'), and we want 'live' to replicate 'tank/home' to 'backup',
+then we can invoke zfs-replicate on 'live' as follows:
+
+  live# zfs-replicate tank/home backup:tank/live/tank/home
+
+Alternatively, the backup server can pull updates:
+
+  backup# zfs-replicate live:tank/home tank/live/tank/home
+
+It is even possible to have a third machine act as an intermediary:
+
+  intermediary# zfs-replicate live:tank/home backup:tank/live/tank/home
+
+But, you probably don't want to do this, because all traffic is
+tunneled via the intermediary.
+
+
+zfs-replicate has a few options, but generally you won't need them.
+Run zfs-replicate --help to see them.
+
+
+Regular Updates
+---------------
+
+You can run zfs-replicate via cron like this:
+
+  # backup the system every day at 1 am.
+  0 1 * * * zfs-replicate tank/home backup:tank/live/tank/home
+
+It is also possible to run it in a while loop:
+
+  while true
+  do
+    zfs-replicate tank/home backup:tank/live/tank/home
+  done
+
+
+SSH
+---
+
+zfs-replicate uses ssh to transfer the data.  Thus, you'll probably
+want to set up ssh public key authentication to avoid having to enter
+a password.  This is quite easy.  To set up public authentication so
+that 'live' can replicate to 'backup', run the following on 'live':
+
+  # ssh-copy-id backup
+
+This will copy your public key stored on 'live' (typically stored in
+~/.ssh/id_rsa.pub) to the authorized keys file
+(~/.ssh/authorized_keys) on 'backup'.
+
+
+MIGRATING TO ZFS-REPLICATE
+==========================
+
+If you've been using another tool to replicate ZFS file systems, you
+don't need to start from scratch when migrating to zfs-replicate.  If
+zfs-replicate sees at least one common snapshot that is also
+reasonable (both snapshots have the name creation time), it will use
+the one with the most recent creation time (with an informational
+warning).  Consider:
+
+  # dd if=/dev/zero of=/tmp/test-image bs=4k count=16k
+  # zpool create test /tmp/test-image
+  # zfs create test/a
+  # touch /test/a/foo
+  # zfs snapshot test/a@backup
+  # zfs send test/a@backup | zfs receive test/b
+  # ./zfs-replicate test/a test/b
+  forster:test/a and forster:test/b have no common zfs-replicate
+  snapshots!  Either the destination repository is not a replica of the
+  source or this is the first time that you are using zfs-replicate.  You
+  can force zfs-replicate to use a specific snapshot that is not managed by
+  zfs-replicate using the --snapshot option.
+  
+  Common snapshots:
+    backup	Sun May  4 12:37 2014		creation time matches
+  
+  Trying the one reasonable match (backup)
+  send from @backup to test/a@zfs-replicate-FROM-forster:test_a-TO-forster:test_b-2014.05.04-12.38.11 estimated size is 0
+  total estimated size is 0
+  TIME        SENT   SNAPSHOT
+  # zpool destroy test
+  # rm -f /tmp/test-image
+
+
+DESIGN
+======
+
+zfs-replicate tries very hard to be robust.  Thus, if the destination
+repository diverged the last replication, it won't automatically roll
+it back (and discard the changes).  Instead, zfs-replicate will
+display an error message and prompt you to rerun with the --rollback
+option.  (You can instead perform the rollback by hand, if you
+prefer.)
+
+Note: After an initial replication, zfs-replicate marks the
+destination as read-only.  You can, of course, disable this, but if
+you modify the destination, which is as easy as an `ls -l' (since this
+updates the atimes!), replication will no longer work.
+
+zfs-replicate starts by taking a snapshot of the source datapool.  The
+name of the snapshot is based on the following template:
+
+  zfs-replicate-FROM-source:datapool-TO-dest:datapool:YYYY.MM.DD-HH.MM.SS
+
+If the name is already in use, zfs-replicate will sleep for a second
+and then try again (at which point, the seconds field will be
+different).  Using this scheme, it is safe to replicate the same
+dataset to multiple destinations.
+
+zfs-replicate then checks whether the destination exists.  If it
+doesn't exist, a full replication is performed.  If the destination
+does exist, then we look for common zfs-replicate snapshots (i.e.,
+those snapshots whose name matches the above template).  If at least
+one common zfs-replicate snapshot exists, then the most recent
+(according to the creation time) is used as the base for an
+incremental send.  If there is no common zfs-replicate snapshot, then
+zfs-replicate looks for common snapshots.  If at least one exists with
+a matching creation time, then we use the one with the most recent
+creation time (assuming that the user is migrating to zfs-replicate).
+If there are none, then something is wrong (e.g., the destination
+isn't a replica of the source) and we stop.
+
+When replicating the data, we specify the `-F' option to `zfs
+receive'.  This does two things: it rolls back the destination to the
+most recent snapshot and synchronizes the snapshots on the destination
+with those on the source.  We want the latter behavior, but we don't
+want `zfs receive' to automatically rollback the destination.  To
+prevent this, we first create a snapshot on the destination.  Thus,
+the roll back will be a no-op (unless the file system is modified
+between the snapshot and the receive, which is rather unlikely).
+
+If zfs-replicate notices that the destination diverged (i.e., was
+modified), then it prints out an error message.  Note: the user
+typically just needs to rerun zfs-replicate with the --rollback option
+to discard the changes.
+
+Independent of whether the replication is successful, we try to remove
+stale snapshots to prevent them from tying up space.  (Typically, we
+maintain just a single snapshot.)  This is a bit complicated, because
+we aren't always certain whether the replication succeeded or not
+(e.g., a connection error could occur after the data is completely
+transferred, but before the ssh connection is cleanly torn down).  If
+we are certain that the replication was successful, then we only need
+to keep the snapshot that we just created.  If we are certain that the
+replication failed (e.g., we couldn't connect to the host or the
+destination pool did not exist), then we can only remove the snapshot
+that we just created.  If we aren't certain of the outcome, then we
+need to keep the current snapshot and the common snapshot (because we
+don't know which one is good).
+
+TEST SUITE
+==========
+
+This program comes with a small test suite.  You can run it from the
+source directory as follows:
+
+  # ./test
+
+Note: you need to be root.
+
+The test suite will create a small temp file and create a ZFS pool in
+it.  All tests will be done on this pool and at the end the pool will
+be destroyed.
+
+If the test fails, edit 'test' and set TRACE to 1 (around line 25) and
+then mail me (neal@walfield.org) the output.
+

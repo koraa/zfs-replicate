@@ -1,0 +1,7 @@
+- Quiet mode (no output except for error messages).
+- Copy file system to a staging area on dest.  Then do a zfs receive.
+    - Add an option called --staging-directory
+    - Use rsync -e 'ssh -o ControlPath ...'.
+    - Use rsync --in-place.
+- Add --no-foo parameters.
+- Create a man page.

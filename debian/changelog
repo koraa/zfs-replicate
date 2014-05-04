@@ -1,0 +1,6 @@
+zfs-replicate (1.0) unstable; urgency=low
+
+  * Initial release.
+
+ -- Neal H. Walfield <neal@walfield.org>  Sun, 04 May 2014 16:37:29 +0200
+
