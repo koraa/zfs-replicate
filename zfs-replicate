@@ -293,9 +293,9 @@ function cleanup() {
       snapshot=$1
 
       verbose "  Releasing snapshot $SOURCE_NAME:$snapshot"
-      # zfs_source release $ZFS_RECURSIVE "$DEST_NAME:$DEST" "$snapshot" \
+      # run_source zfs release $ZFS_RECURSIVE "$DEST_NAME:$DEST" "$snapshot" \
       #   || true
-      if ! zfs_source destroy $ZFS_RECURSIVE "$snapshot" >$OUTPUT 2>&1
+      if ! run_source zfs destroy $ZFS_RECURSIVE "$snapshot" >$OUTPUT 2>&1
       then
         echo "  WARNING: Error destroying stale snapshot $SOURCE_NAME:$snapshot:"
         echo
@@ -415,45 +415,129 @@ fi
 # Execute zfs on the source.
 if test "x$SOURCE_HOST" = xlocalhost
 then
-  function zfs_source() {
+  function run_source() {
+    if test x"$1" = xmbuffer
+    then
+      MBUFFER="$MBUFFER_SOURCE"
+      shift
+    else
+      MBUFFER=
+    fi
+
+    CMD="$1"
+    shift
+    if test x"$CMD" = xzfs
+    then
+      CMD="$ZFS"
+    fi
+
     if test $TRACE_ZFS_COMMANDS -gt 0
     then
-      echo "SOURCE: $ZFS $@" >&2
+      echo "SOURCE: $CMD $@${MBUFFER:+ | }$MBUFFER" >&2
     fi
-    $ZFS "$@"
+
+    if test x"$MBUFFER" = x
+    then
+      $CMD "$@"
+    else
+      $CMD "$@" | $MBUFFER
+    fi
   }
 else
-  function zfs_source() {
+  function run_source() {
+    if test x"$1" = xmbuffer
+    then
+      MBUFFER="${MBUFFER_SOURCE:+| }$MBUFFER_SOURCE"
+      shift
+    else
+      MBUFFER=
+    fi
+
     if test $TRACE_ZFS_COMMANDS -gt 0
     then
-      echo "SOURCE: zfs $@" >&2
+      echo "SOURCE: $@" >&2
     fi
-    ssh $SSH_ARGS -o ControlPath=$SOURCE_SSH_CONTROL "$SOURCE_HOST" zfs "$@"
+    ssh $SSH_ARGS -o ControlPath=$SOURCE_SSH_CONTROL "$SOURCE_HOST" \
+      "$@" $MBUFFER
   }
 fi
 
 # Execute zfs on the destination.
 if test "x$DEST_HOST" = xlocalhost
 then
-  function zfs_dest() {
+  function run_dest() {
+    if test x"$1" = xmbuffer
+    then
+      MBUFFER="$MBUFFER_DEST"
+      shift
+    else
+      MBUFFER=
+    fi
+
+    CMD="$1"
+    shift
+    if test x"$CMD" = xzfs
+    then
+      CMD="$ZFS"
+    fi
+
     if test $TRACE_ZFS_COMMANDS -gt 0
     then
-      echo "DEST: $ZFS $@" >&2
+      echo "DEST: $MBUFFER${MBUFFER:+ | }$CMD $@" >&2
     fi
-    $ZFS "$@"
+
+    if test x"$MBUFFER" = x
+    then
+      $CMD "$@"
+    else
+      $MBUFFER | $CMD "$@"
+    fi
   }
 else
-  function zfs_dest() {
+  function run_dest() {
+    if test x"$1" = xmbuffer
+    then
+      MBUFFER="$MBUFFER_DEST${MBUFFER_DEST:+| }"
+      shift
+    else
+      MBUFFER=
+    fi
+
     if test $TRACE_ZFS_COMMANDS -gt 0
     then
-      echo "DEST: zfs $@" >&2
+      echo "DEST: $MBUFFER$@" >&2
     fi
-    ssh $SSH_ARGS -o ControlPath=$DEST_SSH_CONTROL "$DEST_HOST" zfs "$@"
+    ssh $SSH_ARGS -o ControlPath=$DEST_SSH_CONTROL "$DEST_HOST" $MBUFFER "$@"
   }
 fi
 
+# Check for mbuffer.
+MBUFFER_SOURCE=
+# Note: we can't do: 'run_source mbuffer --version', because
+# run_source specially handles the case where the first parameter is
+# mbuffer.  So, we do 'run_source mbuffer mbuffer --version'.  Since
+# MBUFFER_SOURCE is '' the initial mbuffer disappears.
+if run_source mbuffer mbuffer --version >/dev/null 2>&1
+then
+  MBUFFER_SOURCE="mbuffer -q -m 2%"
+fi
+
+MBUFFER_DEST=
+if test x"$SOURCE_HOST" = x"$DEST_HOST"
+then
+  # The source and destination are on the same host: we only need one
+  # instance.
+  MBUFFER_DEST=
+elif run_dest mbuffer mbuffer --version >/dev/null 2>&1
+then
+  MBUFFER_DEST="mbuffer -q -m 2%"
+fi
+
+verbose "MBUFFER_SOURCE=$MBUFFER_SOURCE"
+verbose "MBUFFER_DEST=$MBUFFER_DEST"
+
 # Make sure the source dataset exists.
-if ! zfs_source list "$SOURCE" >/dev/null
+if ! run_source zfs list "$SOURCE" >/dev/null
 then
   echo "'$SOURCE_HOST:$SOURCE': source dataset not available.  Aborting."
   exit 1
@@ -469,7 +553,7 @@ SNAPSHOT_PREFIX=$(echo "zfs-replicate-FROM-$SOURCE_NAME:$SOURCE-TO-$DEST_NAME:$D
 # prefix.
 SOURCE_SNAPSHOTS_ALL=$(tempfile)
 SOURCE_SNAPSHOTS=$(tempfile)
-zfs_source list -H -r "$SOURCE" -t snapshot \
+run_source zfs list -H -r "$SOURCE" -t snapshot \
   -o 'name,creation' -S creation >$SOURCE_SNAPSHOTS_ALL
 awk '{
   if (index($1, "'"$SOURCE@$SNAPSHOT_PREFIX"'") == 1)
@@ -487,7 +571,7 @@ OUTPUT=$(tempfile)
 while true
 do
   SNAPSHOT="$SNAPSHOT_PREFIX$(date +%Y.%m.%d-%H.%M.%S)"
-  if zfs_source snapshot $ZFS_RECURSIVE "$SOURCE@$SNAPSHOT" >$OUTPUT 2>&1
+  if run_source zfs snapshot $ZFS_RECURSIVE "$SOURCE@$SNAPSHOT" >$OUTPUT 2>&1
   then
     break
   else
@@ -520,7 +604,7 @@ verbose "Created snapshot $SOURCE@$SNAPSHOT"
 # reenable it later, if appropriate.  (Uncomment the following line
 # and the commented lines that call zfs release.)
 
-# zfs_source hold $ZFS_RECURSIVE "$DEST_NAME:$DEST" "$SOURCE@$SNAPSHOT"
+# run_source zfs hold $ZFS_RECURSIVE "$DEST_NAME:$DEST" "$SOURCE@$SNAPSHOT"
 
 
 # Summarze the output (on stdin) of zfs send -vP.  The raw output
@@ -591,20 +675,20 @@ else
   SEND_STDERR='/dev/stderr'
 fi
 
-if ! zfs_dest list "$DEST" >/dev/null 2>&1
+if ! run_dest zfs list "$DEST" >/dev/null 2>&1
 then
   fmt <<EOF
 '$DEST_NAME:$DEST': destination dataset does not exist.  Assuming initial
 replication.
 EOF
-  zfs_source send $ZFS_SEND_ARGS "$SOURCE@$SNAPSHOT" \
+  run_source mbuffer zfs send $ZFS_SEND_ARGS "$SOURCE@$SNAPSHOT" \
         2>$SEND_STDERR \
-    | zfs_dest receive $ZFS_RECEIVE_ARGS "$DEST"
+    | run_dest mbuffer zfs receive $ZFS_RECEIVE_ARGS "$DEST"
 
   REPLICATED=1
 
   # Make the replication read-only to prevent inadvertent changes.
-  zfs_dest set readonly=on "$DEST"
+  run_dest zfs set readonly=on "$DEST"
 
   if test x$SEND_STDERR != x/dev/stderr
   then
@@ -618,7 +702,7 @@ verbose "Destination $DEST_NAME:$DEST already exists.  Assuming incremental back
 
 DEST_SNAPSHOTS_ALL=$(tempfile)
 DEST_SNAPSHOTS=$(tempfile)
-zfs_dest list -H -r "$DEST" -t snapshot \
+run_dest zfs list -H -r "$DEST" -t snapshot \
   -o 'name,creation' -S creation >$DEST_SNAPSHOTS_ALL
 awk '{
   if (index($1, "'"$DEST@$SNAPSHOT_PREFIX"'") == 1)
@@ -710,13 +794,13 @@ verbose "Basing incremental update on snapshot $COMMON_SNAPSHOT."
 # immediately create a snapshot on the destination.  In this way, the
 # zfs receive will roll back to this snapshot (which is then a NOP),
 # but still flush any old snapshots on success.
-zfs_dest snapshot "$DEST@$SNAPSHOT-pre"
+run_dest zfs snapshot "$DEST@$SNAPSHOT-pre"
 
 RECV_STDERR=$(tempfile)
-if ! zfs_source send $ZFS_SEND_ARGS \
+if ! run_source mbuffer zfs send $ZFS_SEND_ARGS \
              -i "$SOURCE@$COMMON_SNAPSHOT" "$SOURCE@$SNAPSHOT" \
              2>$SEND_STDERR \
-       | zfs_dest receive $ZFS_RECEIVE_ARGS "$DEST" 2>$RECV_STDERR
+       | run_dest mbuffer zfs receive $ZFS_RECEIVE_ARGS "$DEST" 2>$RECV_STDERR
 then
   # Reformat the output to remove any newlines and to compress any
   # white space.
@@ -732,12 +816,13 @@ then
     then
       echo
       echo "Rolling back $DEST_NAME:$DEST to $DEST_NAME:$DEST@$COMMON_SNAPSHOT"
-      zfs_dest rollback -r "$DEST@$COMMON_SNAPSHOT"
+      run_dest zfs rollback -r "$DEST@$COMMON_SNAPSHOT"
       # Now, try sending the file system again.
-      if ! zfs_source send $ZFS_SEND_ARGS \
+      if ! run_source mbuffer zfs send $ZFS_SEND_ARGS \
                        -i "$SOURCE@$COMMON_SNAPSHOT" "$SOURCE@$SNAPSHOT" \
                        2>$SEND_STDERR \
-                 | zfs_dest receive $ZFS_RECEIVE_ARGS "$DEST" 2>$RECV_STDERR
+                 | run_dest mbuffer \
+                     zfs receive $ZFS_RECEIVE_ARGS "$DEST" 2>$RECV_STDERR
       then
         echo
         echo "An error occured.  Aborting."
@@ -787,7 +872,7 @@ then
   ' < "$DEST_SNAPSHOTS" | while read -r snapshot
   do
     verbose "  Releasing snapshot $DEST_NAME:$snapshot"
-    if ! zfs_dest destroy $ZFS_RECURSIVE "$snapshot" >$OUTPUT 2>&1
+    if ! run_dest zfs destroy $ZFS_RECURSIVE "$snapshot" >$OUTPUT 2>&1
     then
       echo "  WARNING: Error destroying stale snapshot $DEST_NAME:$snapshot:"
       echo

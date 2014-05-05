@@ -10,10 +10,10 @@ Vcs-Browser:
 
 Package: zfs-replicate
 Architecture: all
-Depends: ${misc:Depends}, zfs-linux | debian-zfs
+Depends: ${misc:Depends}, zfs-linux | debian-zfs, mbuffer
 Description: Utility to locally or remotely replicate ZFS datasets.
  This utility robustly replicates ZFS datasets.  It builds on the
  low-level functionality of zfs send and zfs receive to copy the data.
  This utility automatically manages the required snapshots and
- gracefully recovers from errors.  It it well suited to call from cron
+ gracefully recovers from errors.  It is well suited to call from cron
  or to maintain a live replica.
