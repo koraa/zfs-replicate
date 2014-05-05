@@ -5,8 +5,8 @@ Build-Depends: debhelper (>= 9), help2man
 Standards-Version: 3.9.4
 Section: utils
 Homepage: 
-Vcs-Git: 
-Vcs-Browser: 
+Vcs-Git: git@gitorious.org:zfs-replicate/zfs-replicate.git
+Vcs-Browser: https://gitorious.org/zfs-replicate/zfs-replicate/source/master:
 
 Package: zfs-replicate
 Architecture: all
